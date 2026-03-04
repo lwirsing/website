@@ -6,6 +6,7 @@ import os
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import plotly.express as px
 import requests
 import streamlit as st
 
@@ -151,12 +152,38 @@ def build_map_points(
     beaches: list[Place],
 ) -> pd.DataFrame:
     rows = [
-        {"name": "Selected Home", "lat": selected_home.lat, "lon": selected_home.lng},
-        {"name": "Office", "lat": office.lat, "lon": office.lng},
+        {"name": "Selected Home", "type": "Home", "lat": selected_home.lat, "lon": selected_home.lng},
+        {"name": "Office", "type": "Office", "lat": office.lat, "lon": office.lng},
     ]
     for beach in beaches:
-        rows.append({"name": beach.name, "lat": beach.lat, "lon": beach.lng})
+        rows.append({"name": beach.name, "type": "Beach", "lat": beach.lat, "lon": beach.lng})
     return pd.DataFrame(rows)
+
+
+def build_map_figure(points: pd.DataFrame):
+    center = {"lat": points["lat"].mean(), "lon": points["lon"].mean()}
+    fig = px.scatter_mapbox(
+        points,
+        lat="lat",
+        lon="lon",
+        color="type",
+        text="name",
+        hover_name="name",
+        zoom=9,
+        center=center,
+        color_discrete_map={
+            "Home": "#1f77b4",
+            "Office": "#d62728",
+            "Beach": "#f4a300",
+        },
+    )
+    fig.update_layout(
+        mapbox_style="open-street-map",
+        margin={"l": 0, "r": 0, "t": 0, "b": 0},
+        legend_title_text="Location Type",
+    )
+    fig.update_traces(marker={"size": 14}, textposition="top right")
+    return fig
 
 
 def main() -> None:
@@ -286,8 +313,12 @@ def main() -> None:
         selected_home_text = st.selectbox("Select a home to visualize", commute_df["Home"].tolist())
         selected_home = next(h for h in geocoded_homes if h.address == selected_home_text)
         map_points = build_map_points(selected_home, office, beaches)
-        st.map(map_points, latitude="lat", longitude="lon", size=14)
-        st.dataframe(map_points.rename(columns={"name": "Location"}), use_container_width=True)
+        st.plotly_chart(build_map_figure(map_points), use_container_width=True)
+        st.dataframe(
+            map_points.rename(columns={"name": "Location", "type": "Type"}),
+            use_container_width=True,
+            hide_index=True,
+        )
 
         st.caption(
             "Rush-hour values use Google traffic-aware estimates (best_guess) for the selected times; "
