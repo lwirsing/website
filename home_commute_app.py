@@ -277,6 +277,8 @@ def main() -> None:
 
     if "saved_properties" not in st.session_state:
         st.session_state["saved_properties"] = {}
+    if "analysis_data" not in st.session_state:
+        st.session_state["analysis_data"] = None
 
     default_api_key = os.getenv("GOOGLE_MAPS_API_KEY", "")
     if not default_api_key:
@@ -301,246 +303,305 @@ def main() -> None:
         "Candidate home addresses (one per line)",
         placeholder="123 Main St, East Greenwich, RI\n45 Ocean Ave, Narragansett, RI",
         height=140,
+        key="candidate_addresses",
     )
 
     run = st.button("Analyze Commutes + Beaches", type="primary")
 
-    if not run:
+    if run:
+        if not api_key:
+            st.error("Please add a Google Maps API key in the sidebar.")
+            return
+
+        home_addresses = [line.strip() for line in addresses_raw.splitlines() if line.strip()]
+        if not home_addresses:
+            st.error("Please enter at least one home address.")
+            return
+
+        try:
+            analysis_day = next_weekday(date.today() + timedelta(days=1))
+            morning_ts = to_unix_ts(analysis_day, morning_time)
+            evening_ts = to_unix_ts(analysis_day, evening_time)
+            offpeak_ts = to_unix_ts(analysis_day, offpeak_time)
+
+            office = geocode_address(OFFICE_ADDRESS, api_key)
+            beaches = [geocode_address(b, api_key) for b in POPULAR_RI_BEACHES]
+
+            commute_rows: list[dict] = []
+            beach_rows: list[dict] = []
+            geocoded_homes: list[Place] = []
+
+            progress = st.progress(0.0)
+            total = len(home_addresses)
+
+            for idx, home in enumerate(home_addresses, start=1):
+                place = geocode_address(home, api_key)
+                geocoded_homes.append(place)
+
+                morning = distance_matrix(place.address, office.address, api_key, departure_time=morning_ts)
+                evening = distance_matrix(office.address, place.address, api_key, departure_time=evening_ts)
+                offpeak_to = distance_matrix(place.address, office.address, api_key, departure_time=offpeak_ts)
+                offpeak_from = distance_matrix(office.address, place.address, api_key, departure_time=offpeak_ts)
+
+                beach_elements = distance_matrix_multi_destinations(
+                    place.address,
+                    [b.address for b in beaches],
+                    api_key,
+                )
+
+                rush_roundtrip_min = duration_minutes(morning) + duration_minutes(evening)
+                offpeak_roundtrip_min = duration_minutes(offpeak_to) + duration_minutes(offpeak_from)
+
+                commute_rows.append(
+                    {
+                        "Home": place.address,
+                        "Morning Rush (to office)": duration_text(morning),
+                        "Evening Rush (from office)": duration_text(evening),
+                        "Off-Peak To Office": duration_text(offpeak_to),
+                        "Off-Peak From Office": duration_text(offpeak_from),
+                        "One-Way Distance": morning["distance"]["text"],
+                        "Rush Roundtrip (min)": round(rush_roundtrip_min, 1),
+                        "Off-Peak Roundtrip (min)": round(offpeak_roundtrip_min, 1),
+                        "Traffic Penalty (min)": round(rush_roundtrip_min - offpeak_roundtrip_min, 1),
+                    }
+                )
+
+                for beach, element in zip(beaches, beach_elements):
+                    if element.get("status") != "OK":
+                        continue
+                    beach_rows.append(
+                        {
+                            "Home": place.address,
+                            "Beach": beach.name,
+                            "Distance": element["distance"]["text"],
+                            "Est. Drive Time": element["duration"]["text"],
+                            "Distance (miles)": round(miles(element["distance"]["value"]), 2),
+                        }
+                    )
+
+                progress.progress(idx / total)
+
+            st.session_state["analysis_data"] = {
+                "analysis_day": analysis_day.isoformat(),
+                "office": {
+                    "name": office.name,
+                    "address": office.address,
+                    "lat": office.lat,
+                    "lng": office.lng,
+                },
+                "beaches": [
+                    {
+                        "name": beach.name,
+                        "address": beach.address,
+                        "lat": beach.lat,
+                        "lng": beach.lng,
+                    }
+                    for beach in beaches
+                ],
+                "geocoded_homes": [
+                    {
+                        "name": home.name,
+                        "address": home.address,
+                        "lat": home.lat,
+                        "lng": home.lng,
+                    }
+                    for home in geocoded_homes
+                ],
+                "commute_rows": commute_rows,
+                "beach_rows": beach_rows,
+            }
+        except requests.RequestException as exc:
+            st.error(f"Network/API error: {exc}")
+            return
+        except ValueError as exc:
+            st.error(str(exc))
+            return
+
+    if not st.session_state["analysis_data"]:
         st.info("Enter at least one home address and click Analyze.")
         return
 
-    if not api_key:
-        st.error("Please add a Google Maps API key in the sidebar.")
+    analysis_data = st.session_state["analysis_data"]
+    analysis_day = date.fromisoformat(analysis_data["analysis_day"])
+    office = Place(**analysis_data["office"])
+    beaches = [Place(**beach) for beach in analysis_data["beaches"]]
+    geocoded_homes = [Place(**home) for home in analysis_data["geocoded_homes"]]
+    geocoded_home_index = {home.address: home for home in geocoded_homes}
+    commute_df = pd.DataFrame(analysis_data["commute_rows"]).sort_values("Rush Roundtrip (min)")
+    beach_df = pd.DataFrame(analysis_data["beach_rows"]).sort_values(["Home", "Distance (miles)"])
+
+    st.success(f"Analyzed {len(commute_df)} home(s) for {analysis_day.isoformat()} traffic assumptions.")
+
+    st.subheader("Commute Comparison")
+    st.dataframe(commute_df, use_container_width=True)
+
+    st.subheader("Beach Distance Comparison")
+    st.dataframe(beach_df[["Home", "Beach", "Distance", "Est. Drive Time"]], use_container_width=True)
+
+    st.subheader("Map View")
+    all_homes = commute_df["Home"].tolist()
+    saved_homes_all = list(st.session_state["saved_properties"].keys())
+    show_saved_only = st.toggle(
+        "Show only saved homes in dropdown",
+        value=False,
+        disabled=not saved_homes_all,
+    )
+    if show_saved_only and saved_homes_all:
+        home_options = saved_homes_all
+    else:
+        home_options = all_homes + [home for home in saved_homes_all if home not in all_homes]
+
+    selected_home_text = st.selectbox("Select a home to visualize", home_options)
+    selected_home = geocoded_home_index.get(selected_home_text)
+    if selected_home is None and selected_home_text in st.session_state["saved_properties"]:
+        saved = st.session_state["saved_properties"][selected_home_text]
+        selected_home = Place(
+            name=saved.get("name", selected_home_text),
+            address=saved["home"],
+            lat=float(saved["lat"]),
+            lng=float(saved["lng"]),
+        )
+    if selected_home is None:
+        st.error("Unable to load selected property details. Please analyze that address again.")
         return
 
-    home_addresses = [line.strip() for line in addresses_raw.splitlines() if line.strip()]
-    if not home_addresses:
-        st.error("Please enter at least one home address.")
-        return
+    map_points = build_map_points(selected_home, office, beaches)
 
+    using_fallback = False
+    routes: list[dict] = []
     try:
-        analysis_day = next_weekday(date.today() + timedelta(days=1))
-        morning_ts = to_unix_ts(analysis_day, morning_time)
-        evening_ts = to_unix_ts(analysis_day, evening_time)
-        offpeak_ts = to_unix_ts(analysis_day, offpeak_time)
-
-        office = geocode_address(OFFICE_ADDRESS, api_key)
-        beaches = [geocode_address(b, api_key) for b in POPULAR_RI_BEACHES]
-
-        commute_rows: list[dict] = []
-        beach_rows: list[dict] = []
-        geocoded_homes: list[Place] = []
-
-        progress = st.progress(0.0)
-        total = len(home_addresses)
-
-        for idx, home in enumerate(home_addresses, start=1):
-            place = geocode_address(home, api_key)
-            geocoded_homes.append(place)
-
-            morning = distance_matrix(place.address, office.address, api_key, departure_time=morning_ts)
-            evening = distance_matrix(office.address, place.address, api_key, departure_time=evening_ts)
-            offpeak_to = distance_matrix(place.address, office.address, api_key, departure_time=offpeak_ts)
-            offpeak_from = distance_matrix(office.address, place.address, api_key, departure_time=offpeak_ts)
-
-            beach_elements = distance_matrix_multi_destinations(
-                place.address,
-                [b.address for b in beaches],
-                api_key,
-            )
-
-            rush_roundtrip_min = duration_minutes(morning) + duration_minutes(evening)
-            offpeak_roundtrip_min = duration_minutes(offpeak_to) + duration_minutes(offpeak_from)
-
-            commute_rows.append(
-                {
-                    "Home": place.address,
-                    "Morning Rush (to office)": duration_text(morning),
-                    "Evening Rush (from office)": duration_text(evening),
-                    "Off-Peak To Office": duration_text(offpeak_to),
-                    "Off-Peak From Office": duration_text(offpeak_from),
-                    "One-Way Distance": morning["distance"]["text"],
-                    "Rush Roundtrip (min)": round(rush_roundtrip_min, 1),
-                    "Off-Peak Roundtrip (min)": round(offpeak_roundtrip_min, 1),
-                    "Traffic Penalty (min)": round(rush_roundtrip_min - offpeak_roundtrip_min, 1),
-                }
-            )
-
-            for beach, element in zip(beaches, beach_elements):
-                if element.get("status") != "OK":
-                    continue
-                beach_rows.append(
-                    {
-                        "Home": place.address,
-                        "Beach": beach.name,
-                        "Distance": element["distance"]["text"],
-                        "Est. Drive Time": element["duration"]["text"],
-                        "Distance (miles)": round(miles(element["distance"]["value"]), 2),
-                    }
-                )
-
-            progress.progress(idx / total)
-
-        commute_df = pd.DataFrame(commute_rows).sort_values("Rush Roundtrip (min)")
-        beach_df = pd.DataFrame(beach_rows).sort_values(["Home", "Distance (miles)"])
-
-        st.success(f"Analyzed {len(commute_df)} home(s) for {analysis_day.isoformat()} traffic assumptions.")
-
-        st.subheader("Commute Comparison")
-        st.dataframe(commute_df, use_container_width=True)
-
-        st.subheader("Beach Distance Comparison")
-        st.dataframe(beach_df[["Home", "Beach", "Distance", "Est. Drive Time"]], use_container_width=True)
-
-        st.subheader("Map View")
-        all_homes = commute_df["Home"].tolist()
-        saved_homes_in_current = [home for home in all_homes if home in st.session_state["saved_properties"]]
-        show_saved_only = st.toggle(
-            "Show only saved homes in dropdown",
-            value=False,
-            disabled=not saved_homes_in_current,
-        )
-        home_options = saved_homes_in_current if show_saved_only and saved_homes_in_current else all_homes
-        selected_home_text = st.selectbox("Select a home to visualize", home_options)
-        selected_home = next(h for h in geocoded_homes if h.address == selected_home_text)
-        map_points = build_map_points(selected_home, office, beaches)
-
-        using_fallback = False
-        routes: list[dict] = []
-        try:
-            routes.append(
-                {
-                    "name": "Home -> Office",
-                    "coords": directions_route_points(selected_home.address, office.address, api_key),
-                    "color": "#8b0000",
-                }
-            )
-            for beach in beaches:
-                routes.append(
-                    {
-                        "name": f"Home -> {beach.name}",
-                        "coords": directions_route_points(selected_home.address, beach.address, api_key),
-                        "color": "#666666",
-                    }
-                )
-        except ValueError:
-            using_fallback = True
-            routes.append(
-                {
-                    "name": "Home -> Office",
-                    "coords": straight_line_points(selected_home, office),
-                    "color": "#8b0000",
-                }
-            )
-            for beach in beaches:
-                routes.append(
-                    {
-                        "name": f"Home -> {beach.name}",
-                        "coords": straight_line_points(selected_home, beach),
-                        "color": "#666666",
-                    }
-                )
-
-        st.plotly_chart(build_map_figure(map_points, routes), use_container_width=True)
-        if using_fallback:
-            st.warning(
-                "Could not load turn-by-turn routes from Google Directions API. "
-                "Showing straight-line paths instead."
-            )
-
-        selected_commute_row = (
-            commute_df.loc[commute_df["Home"] == selected_home_text]
-            .iloc[0]
-            .to_dict()
-        )
-        if st.button("Save Selected Property"):
-            st.session_state["saved_properties"][selected_home_text] = {
-                "home": selected_home_text,
-                "saved_at": datetime.now(RI_TZ).isoformat(timespec="seconds"),
-                "analysis_day": analysis_day.isoformat(),
-                "zillow_url": zillow_link(selected_home_text),
-                "commute": selected_commute_row,
+        routes.append(
+            {
+                "name": "Home -> Office",
+                "coords": directions_route_points(selected_home.address, office.address, api_key),
+                "color": "#8b0000",
             }
-            st.success("Saved property. Zillow link and comparison tools are available below.")
-
-        if st.session_state["saved_properties"]:
-            st.subheader("Saved Properties")
-            saved_rows = []
-            for home, rec in st.session_state["saved_properties"].items():
-                commute = rec["commute"]
-                saved_rows.append(
-                    {
-                        "Home": home,
-                        "Analysis Day": rec.get("analysis_day"),
-                        "Morning Rush (to office)": commute.get("Morning Rush (to office)"),
-                        "Evening Rush (from office)": commute.get("Evening Rush (from office)"),
-                        "Rush Roundtrip (min)": commute.get("Rush Roundtrip (min)"),
-                        "Off-Peak Roundtrip (min)": commute.get("Off-Peak Roundtrip (min)"),
-                        "Traffic Penalty (min)": commute.get("Traffic Penalty (min)"),
-                        "Zillow": rec.get("zillow_url"),
-                    }
-                )
-
-            saved_df = pd.DataFrame(saved_rows).sort_values("Rush Roundtrip (min)")
-            st.dataframe(
-                saved_df,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Zillow": st.column_config.LinkColumn("Zillow"),
-                },
+        )
+        for beach in beaches:
+            routes.append(
+                {
+                    "name": f"Home -> {beach.name}",
+                    "coords": directions_route_points(selected_home.address, beach.address, api_key),
+                    "color": "#666666",
+                }
+            )
+    except ValueError:
+        using_fallback = True
+        routes.append(
+            {
+                "name": "Home -> Office",
+                "coords": straight_line_points(selected_home, office),
+                "color": "#8b0000",
+            }
+        )
+        for beach in beaches:
+            routes.append(
+                {
+                    "name": f"Home -> {beach.name}",
+                    "coords": straight_line_points(selected_home, beach),
+                    "color": "#666666",
+                }
             )
 
-            st.subheader("Compare Saved Property Commutes")
-            compare_options = saved_df["Home"].tolist()
-            default_compare = compare_options[:2] if len(compare_options) >= 2 else compare_options
-            selected_compare = st.multiselect(
-                "Select saved properties to compare",
-                options=compare_options,
-                default=default_compare,
-            )
-
-            if len(selected_compare) >= 2:
-                compare_df = saved_df[saved_df["Home"].isin(selected_compare)][
-                    [
-                        "Home",
-                        "Rush Roundtrip (min)",
-                        "Off-Peak Roundtrip (min)",
-                        "Traffic Penalty (min)",
-                    ]
-                ]
-                st.dataframe(compare_df, use_container_width=True, hide_index=True)
-
-                compare_long = compare_df.melt(
-                    id_vars=["Home"],
-                    var_name="Metric",
-                    value_name="Minutes",
-                )
-                compare_fig = px.bar(
-                    compare_long,
-                    x="Home",
-                    y="Minutes",
-                    color="Metric",
-                    barmode="group",
-                )
-                compare_fig.update_layout(
-                    margin={"l": 0, "r": 0, "t": 20, "b": 0},
-                    yaxis_title="Minutes",
-                    xaxis_title="Property",
-                )
-                st.plotly_chart(compare_fig, use_container_width=True)
-            elif len(compare_options) >= 2:
-                st.info("Select at least two saved properties to compare commute times.")
-
-        st.caption(
-            "Rush-hour values use Google traffic-aware estimates (best_guess) for the selected times; "
-            "beach distances use standard driving estimates."
+    st.plotly_chart(build_map_figure(map_points, routes), use_container_width=True)
+    if using_fallback:
+        st.warning(
+            "Could not load turn-by-turn routes from Google Directions API. "
+            "Showing straight-line paths instead."
         )
 
-    except requests.RequestException as exc:
-        st.error(f"Network/API error: {exc}")
-    except ValueError as exc:
-        st.error(str(exc))
+    commute_row = commute_df.loc[commute_df["Home"] == selected_home_text]
+    selected_commute_row = (
+        commute_row.iloc[0].to_dict()
+        if not commute_row.empty
+        else st.session_state["saved_properties"].get(selected_home_text, {}).get("commute", {})
+    )
+    if st.button("Save Selected Property"):
+        st.session_state["saved_properties"][selected_home_text] = {
+            "home": selected_home_text,
+            "name": selected_home.name,
+            "lat": selected_home.lat,
+            "lng": selected_home.lng,
+            "saved_at": datetime.now(RI_TZ).isoformat(timespec="seconds"),
+            "analysis_day": analysis_day.isoformat(),
+            "zillow_url": zillow_link(selected_home_text),
+            "commute": selected_commute_row,
+        }
+        st.success("Saved property. Zillow link and comparison tools are available below.")
+
+    if st.session_state["saved_properties"]:
+        st.subheader("Saved Properties")
+        saved_rows = []
+        for home, rec in st.session_state["saved_properties"].items():
+            commute = rec.get("commute", {})
+            saved_rows.append(
+                {
+                    "Home": home,
+                    "Analysis Day": rec.get("analysis_day"),
+                    "Morning Rush (to office)": commute.get("Morning Rush (to office)"),
+                    "Evening Rush (from office)": commute.get("Evening Rush (from office)"),
+                    "Rush Roundtrip (min)": commute.get("Rush Roundtrip (min)"),
+                    "Off-Peak Roundtrip (min)": commute.get("Off-Peak Roundtrip (min)"),
+                    "Traffic Penalty (min)": commute.get("Traffic Penalty (min)"),
+                    "Zillow": rec.get("zillow_url"),
+                }
+            )
+
+        saved_df = pd.DataFrame(saved_rows).sort_values("Rush Roundtrip (min)", na_position="last")
+        st.dataframe(
+            saved_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Zillow": st.column_config.LinkColumn("Zillow"),
+            },
+        )
+
+        st.subheader("Compare Saved Property Commutes")
+        compare_options = saved_df["Home"].tolist()
+        default_compare = compare_options[:2] if len(compare_options) >= 2 else compare_options
+        selected_compare = st.multiselect(
+            "Select saved properties to compare",
+            options=compare_options,
+            default=default_compare,
+        )
+
+        if len(selected_compare) >= 2:
+            compare_df = saved_df[saved_df["Home"].isin(selected_compare)][
+                [
+                    "Home",
+                    "Rush Roundtrip (min)",
+                    "Off-Peak Roundtrip (min)",
+                    "Traffic Penalty (min)",
+                ]
+            ]
+            st.dataframe(compare_df, use_container_width=True, hide_index=True)
+
+            compare_long = compare_df.melt(
+                id_vars=["Home"],
+                var_name="Metric",
+                value_name="Minutes",
+            )
+            compare_fig = px.bar(
+                compare_long,
+                x="Home",
+                y="Minutes",
+                color="Metric",
+                barmode="group",
+            )
+            compare_fig.update_layout(
+                margin={"l": 0, "r": 0, "t": 20, "b": 0},
+                yaxis_title="Minutes",
+                xaxis_title="Property",
+            )
+            st.plotly_chart(compare_fig, use_container_width=True)
+        elif len(compare_options) >= 2:
+            st.info("Select at least two saved properties to compare commute times.")
+
+    st.caption(
+        "Rush-hour values use Google traffic-aware estimates (best_guess) for the selected times; "
+        "beach distances use standard driving estimates."
+    )
 
 
 if __name__ == "__main__":
