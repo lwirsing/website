@@ -16,4 +16,4 @@ COPY . .
 
 EXPOSE 10000
 
-CMD ["sh", "-c", "streamlit run home_commute_app.py --server.address=0.0.0.0 --server.port=8501 & envsubst '$PORT' < /app/nginx.conf.template > /etc/nginx/nginx.conf && nginx -g 'daemon off;'"]
+CMD ["sh", "-c", "streamlit run home_commute_app.py --server.address=0.0.0.0 --server.port=8501 & rm -f /etc/nginx/conf.d/default.conf /etc/nginx/sites-enabled/default && envsubst '$PORT' < /app/nginx.default.conf.template > /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'"]
