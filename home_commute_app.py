@@ -6,7 +6,6 @@ import os
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-import pydeck as pdk
 import requests
 import streamlit as st
 
@@ -146,102 +145,18 @@ def miles(distance_value_meters: int) -> float:
     return distance_value_meters * 0.000621371
 
 
-def build_map(
+def build_map_points(
     selected_home: Place,
     office: Place,
     beaches: list[Place],
-) -> pdk.Deck:
-    points = [
-        {
-            "name": "Office",
-            "kind": "office",
-            "lat": office.lat,
-            "lng": office.lng,
-            "color": [220, 20, 60],
-        },
-        {
-            "name": "Selected Home",
-            "kind": "home",
-            "lat": selected_home.lat,
-            "lng": selected_home.lng,
-            "color": [0, 123, 255],
-        },
+) -> pd.DataFrame:
+    rows = [
+        {"name": "Selected Home", "lat": selected_home.lat, "lon": selected_home.lng},
+        {"name": "Office", "lat": office.lat, "lon": office.lng},
     ]
-
     for beach in beaches:
-        points.append(
-            {
-                "name": beach.name,
-                "kind": "beach",
-                "lat": beach.lat,
-                "lng": beach.lng,
-                "color": [245, 160, 0],
-            }
-        )
-
-    lines = [
-        {
-            "source_lat": selected_home.lat,
-            "source_lng": selected_home.lng,
-            "target_lat": office.lat,
-            "target_lng": office.lng,
-            "label": "Home ↔ Office",
-            "color": [180, 40, 40],
-        }
-    ]
-
-    for beach in beaches:
-        lines.append(
-            {
-                "source_lat": selected_home.lat,
-                "source_lng": selected_home.lng,
-                "target_lat": beach.lat,
-                "target_lng": beach.lng,
-                "label": f"Home ↔ {beach.name}",
-                "color": [120, 120, 120],
-            }
-        )
-
-    point_layer = pdk.Layer(
-        "ScatterplotLayer",
-        data=points,
-        get_position="[lng, lat]",
-        get_fill_color="color",
-        get_radius=450,
-        pickable=True,
-    )
-
-    text_layer = pdk.Layer(
-        "TextLayer",
-        data=points,
-        get_position="[lng, lat]",
-        get_text="name",
-        get_color=[20, 20, 20],
-        get_size=14,
-        get_alignment_baseline="bottom",
-        get_pixel_offset=[0, -10],
-    )
-
-    line_layer = pdk.Layer(
-        "LineLayer",
-        data=lines,
-        get_source_position="[source_lng, source_lat]",
-        get_target_position="[target_lng, target_lat]",
-        get_color="color",
-        get_width=3,
-        pickable=True,
-    )
-
-    center_lat = (selected_home.lat + office.lat) / 2
-    center_lng = (selected_home.lng + office.lng) / 2
-
-    return pdk.Deck(
-        map_provider="carto",
-        map_style="light",
-        initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lng, zoom=9),
-        layers=[line_layer, point_layer, text_layer],
-        tooltip={"text": "{name}"},
-    )
+        rows.append({"name": beach.name, "lat": beach.lat, "lon": beach.lng})
+    return pd.DataFrame(rows)
 
 
 def main() -> None:
@@ -370,7 +285,9 @@ def main() -> None:
         st.subheader("Map View")
         selected_home_text = st.selectbox("Select a home to visualize", commute_df["Home"].tolist())
         selected_home = next(h for h in geocoded_homes if h.address == selected_home_text)
-        st.pydeck_chart(build_map(selected_home, office, beaches), use_container_width=True)
+        map_points = build_map_points(selected_home, office, beaches)
+        st.map(map_points, latitude="lat", longitude="lon", size=14)
+        st.dataframe(map_points.rename(columns={"name": "Location"}), use_container_width=True)
 
         st.caption(
             "Rush-hour values use Google traffic-aware estimates (best_guess) for the selected times; "
