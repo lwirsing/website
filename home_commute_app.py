@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+import json
 import os
+from pathlib import Path
+import sqlite3
 from urllib.parse import quote_plus
 from zoneinfo import ZoneInfo
 
@@ -25,6 +28,7 @@ POPULAR_RI_BEACHES = [
     "Roger W. Wheeler State Beach, Narragansett, RI",
     "Sachuest Beach (Second Beach), Middletown, RI",
 ]
+SAVED_DB_PATH = Path("homesearch_data.db")
 
 
 @dataclass
@@ -33,6 +37,89 @@ class Place:
     address: str
     lat: float
     lng: float
+
+
+def get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(SAVED_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_saved_db() -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS saved_properties (
+                home TEXT PRIMARY KEY,
+                name TEXT,
+                lat REAL NOT NULL,
+                lng REAL NOT NULL,
+                saved_at TEXT NOT NULL,
+                analysis_day TEXT,
+                zillow_url TEXT,
+                commute_json TEXT
+            )
+            """
+        )
+
+
+def load_saved_properties() -> dict[str, dict]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM saved_properties ORDER BY saved_at DESC").fetchall()
+
+    saved: dict[str, dict] = {}
+    for row in rows:
+        commute = {}
+        if row["commute_json"]:
+            try:
+                commute = json.loads(row["commute_json"])
+            except json.JSONDecodeError:
+                commute = {}
+        saved[row["home"]] = {
+            "home": row["home"],
+            "name": row["name"] or row["home"],
+            "lat": float(row["lat"]),
+            "lng": float(row["lng"]),
+            "saved_at": row["saved_at"],
+            "analysis_day": row["analysis_day"],
+            "zillow_url": row["zillow_url"] or zillow_link(row["home"]),
+            "commute": commute,
+        }
+    return saved
+
+
+def upsert_saved_property(record: dict) -> None:
+    commute_json = json.dumps(record.get("commute", {}))
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO saved_properties(home, name, lat, lng, saved_at, analysis_day, zillow_url, commute_json)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(home) DO UPDATE SET
+                name=excluded.name,
+                lat=excluded.lat,
+                lng=excluded.lng,
+                saved_at=excluded.saved_at,
+                analysis_day=excluded.analysis_day,
+                zillow_url=excluded.zillow_url,
+                commute_json=excluded.commute_json
+            """,
+            (
+                record["home"],
+                record.get("name", record["home"]),
+                float(record["lat"]),
+                float(record["lng"]),
+                record["saved_at"],
+                record.get("analysis_day"),
+                record.get("zillow_url", zillow_link(record["home"])),
+                commute_json,
+            ),
+        )
+
+
+def delete_saved_property(home: str) -> None:
+    with get_conn() as conn:
+        conn.execute("DELETE FROM saved_properties WHERE home = ?", (home,))
 
 
 def next_weekday(start: date) -> date:
@@ -279,6 +366,8 @@ def main() -> None:
         st.session_state["saved_properties"] = {}
     if "analysis_data" not in st.session_state:
         st.session_state["analysis_data"] = None
+    init_saved_db()
+    st.session_state["saved_properties"] = load_saved_properties()
 
     default_api_key = os.getenv("GOOGLE_MAPS_API_KEY", "")
     if not default_api_key:
@@ -417,117 +506,118 @@ def main() -> None:
             st.error(str(exc))
             return
 
-    if not st.session_state["analysis_data"]:
-        st.info("Enter at least one home address and click Analyze.")
-        return
+    if st.session_state["analysis_data"]:
+        analysis_data = st.session_state["analysis_data"]
+        analysis_day = date.fromisoformat(analysis_data["analysis_day"])
+        office = Place(**analysis_data["office"])
+        beaches = [Place(**beach) for beach in analysis_data["beaches"]]
+        geocoded_homes = [Place(**home) for home in analysis_data["geocoded_homes"]]
+        geocoded_home_index = {home.address: home for home in geocoded_homes}
+        commute_df = pd.DataFrame(analysis_data["commute_rows"]).sort_values("Rush Roundtrip (min)")
+        beach_df = pd.DataFrame(analysis_data["beach_rows"]).sort_values(["Home", "Distance (miles)"])
 
-    analysis_data = st.session_state["analysis_data"]
-    analysis_day = date.fromisoformat(analysis_data["analysis_day"])
-    office = Place(**analysis_data["office"])
-    beaches = [Place(**beach) for beach in analysis_data["beaches"]]
-    geocoded_homes = [Place(**home) for home in analysis_data["geocoded_homes"]]
-    geocoded_home_index = {home.address: home for home in geocoded_homes}
-    commute_df = pd.DataFrame(analysis_data["commute_rows"]).sort_values("Rush Roundtrip (min)")
-    beach_df = pd.DataFrame(analysis_data["beach_rows"]).sort_values(["Home", "Distance (miles)"])
+        st.success(f"Analyzed {len(commute_df)} home(s) for {analysis_day.isoformat()} traffic assumptions.")
 
-    st.success(f"Analyzed {len(commute_df)} home(s) for {analysis_day.isoformat()} traffic assumptions.")
+        st.subheader("Commute Comparison")
+        st.dataframe(commute_df, use_container_width=True)
 
-    st.subheader("Commute Comparison")
-    st.dataframe(commute_df, use_container_width=True)
+        st.subheader("Beach Distance Comparison")
+        st.dataframe(beach_df[["Home", "Beach", "Distance", "Est. Drive Time"]], use_container_width=True)
 
-    st.subheader("Beach Distance Comparison")
-    st.dataframe(beach_df[["Home", "Beach", "Distance", "Est. Drive Time"]], use_container_width=True)
+        st.subheader("Map View")
+        all_homes = commute_df["Home"].tolist()
+        saved_homes_all = list(st.session_state["saved_properties"].keys())
+        show_saved_only = st.toggle(
+            "Show only saved homes in dropdown",
+            value=False,
+            disabled=not saved_homes_all,
+        )
+        if show_saved_only and saved_homes_all:
+            home_options = saved_homes_all
+        else:
+            home_options = all_homes + [home for home in saved_homes_all if home not in all_homes]
 
-    st.subheader("Map View")
-    all_homes = commute_df["Home"].tolist()
-    saved_homes_all = list(st.session_state["saved_properties"].keys())
-    show_saved_only = st.toggle(
-        "Show only saved homes in dropdown",
-        value=False,
-        disabled=not saved_homes_all,
-    )
-    if show_saved_only and saved_homes_all:
-        home_options = saved_homes_all
+        selected_home_text = st.selectbox("Select a home to visualize", home_options)
+        selected_home = geocoded_home_index.get(selected_home_text)
+        if selected_home is None and selected_home_text in st.session_state["saved_properties"]:
+            saved = st.session_state["saved_properties"][selected_home_text]
+            selected_home = Place(
+                name=saved.get("name", selected_home_text),
+                address=saved["home"],
+                lat=float(saved["lat"]),
+                lng=float(saved["lng"]),
+            )
+        if selected_home is None:
+            st.error("Unable to load selected property details. Please analyze that address again.")
+            return
+
+        map_points = build_map_points(selected_home, office, beaches)
+
+        using_fallback = False
+        routes: list[dict] = []
+        try:
+            routes.append(
+                {
+                    "name": "Home -> Office",
+                    "coords": directions_route_points(selected_home.address, office.address, api_key),
+                    "color": "#8b0000",
+                }
+            )
+            for beach in beaches:
+                routes.append(
+                    {
+                        "name": f"Home -> {beach.name}",
+                        "coords": directions_route_points(selected_home.address, beach.address, api_key),
+                        "color": "#666666",
+                    }
+                )
+        except ValueError:
+            using_fallback = True
+            routes.append(
+                {
+                    "name": "Home -> Office",
+                    "coords": straight_line_points(selected_home, office),
+                    "color": "#8b0000",
+                }
+            )
+            for beach in beaches:
+                routes.append(
+                    {
+                        "name": f"Home -> {beach.name}",
+                        "coords": straight_line_points(selected_home, beach),
+                        "color": "#666666",
+                    }
+                )
+
+        st.plotly_chart(build_map_figure(map_points, routes), use_container_width=True)
+        if using_fallback:
+            st.warning(
+                "Could not load turn-by-turn routes from Google Directions API. "
+                "Showing straight-line paths instead."
+            )
+
+        commute_row = commute_df.loc[commute_df["Home"] == selected_home_text]
+        selected_commute_row = (
+            commute_row.iloc[0].to_dict()
+            if not commute_row.empty
+            else st.session_state["saved_properties"].get(selected_home_text, {}).get("commute", {})
+        )
+        if st.button("Save Selected Property"):
+            record = {
+                "home": selected_home_text,
+                "name": selected_home.name,
+                "lat": selected_home.lat,
+                "lng": selected_home.lng,
+                "saved_at": datetime.now(RI_TZ).isoformat(timespec="seconds"),
+                "analysis_day": analysis_day.isoformat(),
+                "zillow_url": zillow_link(selected_home_text),
+                "commute": selected_commute_row,
+            }
+            upsert_saved_property(record)
+            st.session_state["saved_properties"] = load_saved_properties()
+            st.success("Saved property. Zillow link and comparison tools are available below.")
     else:
-        home_options = all_homes + [home for home in saved_homes_all if home not in all_homes]
-
-    selected_home_text = st.selectbox("Select a home to visualize", home_options)
-    selected_home = geocoded_home_index.get(selected_home_text)
-    if selected_home is None and selected_home_text in st.session_state["saved_properties"]:
-        saved = st.session_state["saved_properties"][selected_home_text]
-        selected_home = Place(
-            name=saved.get("name", selected_home_text),
-            address=saved["home"],
-            lat=float(saved["lat"]),
-            lng=float(saved["lng"]),
-        )
-    if selected_home is None:
-        st.error("Unable to load selected property details. Please analyze that address again.")
-        return
-
-    map_points = build_map_points(selected_home, office, beaches)
-
-    using_fallback = False
-    routes: list[dict] = []
-    try:
-        routes.append(
-            {
-                "name": "Home -> Office",
-                "coords": directions_route_points(selected_home.address, office.address, api_key),
-                "color": "#8b0000",
-            }
-        )
-        for beach in beaches:
-            routes.append(
-                {
-                    "name": f"Home -> {beach.name}",
-                    "coords": directions_route_points(selected_home.address, beach.address, api_key),
-                    "color": "#666666",
-                }
-            )
-    except ValueError:
-        using_fallback = True
-        routes.append(
-            {
-                "name": "Home -> Office",
-                "coords": straight_line_points(selected_home, office),
-                "color": "#8b0000",
-            }
-        )
-        for beach in beaches:
-            routes.append(
-                {
-                    "name": f"Home -> {beach.name}",
-                    "coords": straight_line_points(selected_home, beach),
-                    "color": "#666666",
-                }
-            )
-
-    st.plotly_chart(build_map_figure(map_points, routes), use_container_width=True)
-    if using_fallback:
-        st.warning(
-            "Could not load turn-by-turn routes from Google Directions API. "
-            "Showing straight-line paths instead."
-        )
-
-    commute_row = commute_df.loc[commute_df["Home"] == selected_home_text]
-    selected_commute_row = (
-        commute_row.iloc[0].to_dict()
-        if not commute_row.empty
-        else st.session_state["saved_properties"].get(selected_home_text, {}).get("commute", {})
-    )
-    if st.button("Save Selected Property"):
-        st.session_state["saved_properties"][selected_home_text] = {
-            "home": selected_home_text,
-            "name": selected_home.name,
-            "lat": selected_home.lat,
-            "lng": selected_home.lng,
-            "saved_at": datetime.now(RI_TZ).isoformat(timespec="seconds"),
-            "analysis_day": analysis_day.isoformat(),
-            "zillow_url": zillow_link(selected_home_text),
-            "commute": selected_commute_row,
-        }
-        st.success("Saved property. Zillow link and comparison tools are available below.")
+        st.info("Enter at least one home address and click Analyze to refresh commute and map data.")
 
     if st.session_state["saved_properties"]:
         st.subheader("Saved Properties")
@@ -556,6 +646,19 @@ def main() -> None:
                 "Zillow": st.column_config.LinkColumn("Zillow"),
             },
         )
+
+        to_delete = st.multiselect(
+            "Delete saved properties",
+            options=saved_df["Home"].tolist(),
+            default=[],
+            key="delete_saved_properties",
+        )
+        if st.button("Delete Selected", disabled=not to_delete):
+            for home in to_delete:
+                delete_saved_property(home)
+            st.session_state["saved_properties"] = load_saved_properties()
+            st.success("Deleted selected saved properties.")
+            st.rerun()
 
         st.subheader("Compare Saved Property Commutes")
         compare_options = saved_df["Home"].tolist()
