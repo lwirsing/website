@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Larry Wirsing</title>
+    <style>
+      :root {
+        --bg: #f6f7f9;
+        --text: #111827;
+        --accent: #0f766e;
+        --muted: #4b5563;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        font-family: "Avenir Next", "Segoe UI", sans-serif;
+        color: var(--text);
+        background: radial-gradient(circle at 20% 20%, #ffffff, var(--bg));
+      }
+      .card {
+        width: min(700px, 92vw);
+        padding: 48px 36px;
+        border-radius: 18px;
+        background: #ffffff;
+        box-shadow: 0 12px 40px rgba(0, 0, 0, 0.08);
+        text-align: center;
+      }
+      h1 {
+        margin: 0;
+        font-size: clamp(2rem, 5vw, 3.2rem);
+        letter-spacing: 0.02em;
+      }
+      p {
+        margin: 14px 0 0;
+        color: var(--muted);
+        font-size: 1.05rem;
+      }
+      a {
+        margin-top: 24px;
+        display: inline-block;
+        padding: 12px 20px;
+        border-radius: 999px;
+        color: white;
+        background: var(--accent);
+        text-decoration: none;
+        font-weight: 600;
+      }
+      a:hover { opacity: 0.92; }
+    </style>
+  </head>
+  <body>
+    <main class="card">
+      <h1>Coming Soon</h1>
+      <p>New site is on the way.</p>
+      <a href="/homesearch">Open Home Search App</a>
+    </main>
+  </body>
+</html>
