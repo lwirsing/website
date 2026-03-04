@@ -2,7 +2,6 @@
 headless = true
 enableCORS = false
 enableXsrfProtection = false
-baseUrlPath = "homesearch"
 
 [browser]
 gatherUsageStats = false
