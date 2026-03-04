@@ -28,7 +28,7 @@ POPULAR_RI_BEACHES = [
     "Roger W. Wheeler State Beach, Narragansett, RI",
     "Sachuest Beach (Second Beach), Middletown, RI",
 ]
-SAVED_DB_PATH = Path("homesearch_data.db")
+SAVED_DB_PATH = Path(os.getenv("SAVED_DB_PATH", "homesearch_data.db"))
 
 
 @dataclass
@@ -361,6 +361,11 @@ def main() -> None:
     st.caption(
         "Compare commute times to your office with traffic-aware estimates and view distances to popular RI beaches."
     )
+    if os.getenv("RENDER") and str(SAVED_DB_PATH) == "homesearch_data.db":
+        st.warning(
+            "Saved properties may reset on Render restarts. "
+            "Set `SAVED_DB_PATH` to a persistent disk path (for example `/var/data/homesearch_data.db`)."
+        )
 
     if "saved_properties" not in st.session_state:
         st.session_state["saved_properties"] = {}
