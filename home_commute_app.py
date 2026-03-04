@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 import os
+from urllib.parse import quote_plus
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -147,6 +148,10 @@ def miles(distance_value_meters: int) -> float:
     return distance_value_meters * 0.000621371
 
 
+def zillow_link(address: str) -> str:
+    return f"https://www.zillow.com/homes/{quote_plus(address)}_rb/"
+
+
 def decode_polyline(encoded: str) -> list[tuple[float, float]]:
     points: list[tuple[float, float]] = []
     index = 0
@@ -270,6 +275,9 @@ def main() -> None:
         "Compare commute times to your office with traffic-aware estimates and view distances to popular RI beaches."
     )
 
+    if "saved_properties" not in st.session_state:
+        st.session_state["saved_properties"] = {}
+
     default_api_key = os.getenv("GOOGLE_MAPS_API_KEY", "")
     if not default_api_key:
         try:
@@ -385,7 +393,15 @@ def main() -> None:
         st.dataframe(beach_df[["Home", "Beach", "Distance", "Est. Drive Time"]], use_container_width=True)
 
         st.subheader("Map View")
-        selected_home_text = st.selectbox("Select a home to visualize", commute_df["Home"].tolist())
+        all_homes = commute_df["Home"].tolist()
+        saved_homes_in_current = [home for home in all_homes if home in st.session_state["saved_properties"]]
+        show_saved_only = st.toggle(
+            "Show only saved homes in dropdown",
+            value=False,
+            disabled=not saved_homes_in_current,
+        )
+        home_options = saved_homes_in_current if show_saved_only and saved_homes_in_current else all_homes
+        selected_home_text = st.selectbox("Select a home to visualize", home_options)
         selected_home = next(h for h in geocoded_homes if h.address == selected_home_text)
         map_points = build_map_points(selected_home, office, beaches)
 
@@ -431,6 +447,90 @@ def main() -> None:
                 "Could not load turn-by-turn routes from Google Directions API. "
                 "Showing straight-line paths instead."
             )
+
+        selected_commute_row = (
+            commute_df.loc[commute_df["Home"] == selected_home_text]
+            .iloc[0]
+            .to_dict()
+        )
+        if st.button("Save Selected Property"):
+            st.session_state["saved_properties"][selected_home_text] = {
+                "home": selected_home_text,
+                "saved_at": datetime.now(RI_TZ).isoformat(timespec="seconds"),
+                "analysis_day": analysis_day.isoformat(),
+                "zillow_url": zillow_link(selected_home_text),
+                "commute": selected_commute_row,
+            }
+            st.success("Saved property. Zillow link and comparison tools are available below.")
+
+        if st.session_state["saved_properties"]:
+            st.subheader("Saved Properties")
+            saved_rows = []
+            for home, rec in st.session_state["saved_properties"].items():
+                commute = rec["commute"]
+                saved_rows.append(
+                    {
+                        "Home": home,
+                        "Analysis Day": rec.get("analysis_day"),
+                        "Morning Rush (to office)": commute.get("Morning Rush (to office)"),
+                        "Evening Rush (from office)": commute.get("Evening Rush (from office)"),
+                        "Rush Roundtrip (min)": commute.get("Rush Roundtrip (min)"),
+                        "Off-Peak Roundtrip (min)": commute.get("Off-Peak Roundtrip (min)"),
+                        "Traffic Penalty (min)": commute.get("Traffic Penalty (min)"),
+                        "Zillow": rec.get("zillow_url"),
+                    }
+                )
+
+            saved_df = pd.DataFrame(saved_rows).sort_values("Rush Roundtrip (min)")
+            st.dataframe(
+                saved_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Zillow": st.column_config.LinkColumn("Zillow"),
+                },
+            )
+
+            st.subheader("Compare Saved Property Commutes")
+            compare_options = saved_df["Home"].tolist()
+            default_compare = compare_options[:2] if len(compare_options) >= 2 else compare_options
+            selected_compare = st.multiselect(
+                "Select saved properties to compare",
+                options=compare_options,
+                default=default_compare,
+            )
+
+            if len(selected_compare) >= 2:
+                compare_df = saved_df[saved_df["Home"].isin(selected_compare)][
+                    [
+                        "Home",
+                        "Rush Roundtrip (min)",
+                        "Off-Peak Roundtrip (min)",
+                        "Traffic Penalty (min)",
+                    ]
+                ]
+                st.dataframe(compare_df, use_container_width=True, hide_index=True)
+
+                compare_long = compare_df.melt(
+                    id_vars=["Home"],
+                    var_name="Metric",
+                    value_name="Minutes",
+                )
+                compare_fig = px.bar(
+                    compare_long,
+                    x="Home",
+                    y="Minutes",
+                    color="Metric",
+                    barmode="group",
+                )
+                compare_fig.update_layout(
+                    margin={"l": 0, "r": 0, "t": 20, "b": 0},
+                    yaxis_title="Minutes",
+                    xaxis_title="Property",
+                )
+                st.plotly_chart(compare_fig, use_container_width=True)
+            elif len(compare_options) >= 2:
+                st.info("Select at least two saved properties to compare commute times.")
 
         st.caption(
             "Rush-hour values use Google traffic-aware estimates (best_guess) for the selected times; "
