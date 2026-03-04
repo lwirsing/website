@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Virtual env
+.venv/
+
+# Local secrets
+.streamlit/secrets.toml
+.env
+
+# Local data files
+finance_data.db
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
