@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 
@@ -146,6 +147,67 @@ def miles(distance_value_meters: int) -> float:
     return distance_value_meters * 0.000621371
 
 
+def decode_polyline(encoded: str) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+    index = 0
+    lat = 0
+    lng = 0
+
+    while index < len(encoded):
+        shift = 0
+        result = 0
+        while True:
+            b = ord(encoded[index]) - 63
+            index += 1
+            result |= (b & 0x1F) << shift
+            shift += 5
+            if b < 0x20:
+                break
+        delta_lat = ~(result >> 1) if (result & 1) else (result >> 1)
+        lat += delta_lat
+
+        shift = 0
+        result = 0
+        while True:
+            b = ord(encoded[index]) - 63
+            index += 1
+            result |= (b & 0x1F) << shift
+            shift += 5
+            if b < 0x20:
+                break
+        delta_lng = ~(result >> 1) if (result & 1) else (result >> 1)
+        lng += delta_lng
+
+        points.append((lat / 1e5, lng / 1e5))
+
+    return points
+
+
+@st.cache_data(show_spinner=False)
+def directions_route_points(origin: str, destination: str, api_key: str) -> list[tuple[float, float]]:
+    resp = requests.get(
+        "https://maps.googleapis.com/maps/api/directions/json",
+        params={
+            "origin": origin,
+            "destination": destination,
+            "mode": "driving",
+            "key": api_key,
+        },
+        timeout=20,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    if payload.get("status") != "OK" or not payload.get("routes"):
+        raise ValueError(f"Directions lookup failed ({origin} -> {destination}): {payload.get('status')}")
+
+    polyline = payload["routes"][0]["overview_polyline"]["points"]
+    return decode_polyline(polyline)
+
+
+def straight_line_points(origin: Place, destination: Place) -> list[tuple[float, float]]:
+    return [(origin.lat, origin.lng), (destination.lat, destination.lng)]
+
+
 def build_map_points(
     selected_home: Place,
     office: Place,
@@ -160,7 +222,7 @@ def build_map_points(
     return pd.DataFrame(rows)
 
 
-def build_map_figure(points: pd.DataFrame):
+def build_map_figure(points: pd.DataFrame, routes: list[dict]):
     center = {"lat": points["lat"].mean(), "lon": points["lon"].mean()}
     fig = px.scatter_mapbox(
         points,
@@ -183,6 +245,22 @@ def build_map_figure(points: pd.DataFrame):
         legend_title_text="Location Type",
     )
     fig.update_traces(marker={"size": 14}, textposition="top right")
+    for route in routes:
+        if not route["coords"]:
+            continue
+        lat_vals = [coord[0] for coord in route["coords"]]
+        lon_vals = [coord[1] for coord in route["coords"]]
+        fig.add_trace(
+            go.Scattermapbox(
+                lat=lat_vals,
+                lon=lon_vals,
+                mode="lines",
+                line={"width": 3, "color": route["color"]},
+                name=route["name"],
+                hovertemplate=f"{route['name']}<extra></extra>",
+                showlegend=True,
+            )
+        )
     return fig
 
 
@@ -205,14 +283,11 @@ def main() -> None:
             "Google Maps API key",
             type="password",
             value=default_api_key,
-            help="Enable Geocoding API and Distance Matrix API in your Google Cloud project.",
+            help="Enable Geocoding API, Distance Matrix API, and Directions API in your Google Cloud project.",
         )
         morning_time = st.time_input("Morning rush departure", value=time(8, 30))
         evening_time = st.time_input("Evening rush departure", value=time(17, 30))
         offpeak_time = st.time_input("Off-peak departure", value=time(11, 0))
-
-    st.subheader("Office")
-    st.code(OFFICE_ADDRESS)
 
     addresses_raw = st.text_area(
         "Candidate home addresses (one per line)",
@@ -313,12 +388,49 @@ def main() -> None:
         selected_home_text = st.selectbox("Select a home to visualize", commute_df["Home"].tolist())
         selected_home = next(h for h in geocoded_homes if h.address == selected_home_text)
         map_points = build_map_points(selected_home, office, beaches)
-        st.plotly_chart(build_map_figure(map_points), use_container_width=True)
-        st.dataframe(
-            map_points.rename(columns={"name": "Location", "type": "Type"}),
-            use_container_width=True,
-            hide_index=True,
-        )
+
+        using_fallback = False
+        routes: list[dict] = []
+        try:
+            routes.append(
+                {
+                    "name": "Home -> Office",
+                    "coords": directions_route_points(selected_home.address, office.address, api_key),
+                    "color": "#8b0000",
+                }
+            )
+            for beach in beaches:
+                routes.append(
+                    {
+                        "name": f"Home -> {beach.name}",
+                        "coords": directions_route_points(selected_home.address, beach.address, api_key),
+                        "color": "#666666",
+                    }
+                )
+        except ValueError:
+            using_fallback = True
+            routes.append(
+                {
+                    "name": "Home -> Office",
+                    "coords": straight_line_points(selected_home, office),
+                    "color": "#8b0000",
+                }
+            )
+            for beach in beaches:
+                routes.append(
+                    {
+                        "name": f"Home -> {beach.name}",
+                        "coords": straight_line_points(selected_home, beach),
+                        "color": "#666666",
+                    }
+                )
+
+        st.plotly_chart(build_map_figure(map_points, routes), use_container_width=True)
+        if using_fallback:
+            st.warning(
+                "Could not load turn-by-turn routes from Google Directions API. "
+                "Showing straight-line paths instead."
+            )
 
         st.caption(
             "Rush-hour values use Google traffic-aware estimates (best_guess) for the selected times; "
