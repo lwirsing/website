@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: ri-home-commute-explorer
+    env: docker
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    healthCheckPath: /
+    envVars:
+      - key: GOOGLE_MAPS_API_KEY
+        sync: false
